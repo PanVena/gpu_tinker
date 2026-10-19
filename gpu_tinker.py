@@ -15,7 +15,7 @@
 
 Процеси у VRAM: для AMD/Nouveau/Intel читаються з /proc/*/fdinfo
 (без root видно лише власні процеси), для NVIDIA — через nvidia-smi
-(усі обчислювальні процеси).
+(усі процеси, включно з OpenGL/EGL-контекстами).
 
 Залежності: python3-pyside6, pciutils (lspci), kscreen (kscreen-doctor).
 Для NVIDIA додатково використовується nvidia-smi, якщо він є.
@@ -124,8 +124,9 @@ def nvidia_stats():
     return res
 
 
-def nvidia_compute_apps():
-    """{pci: {pid: (назва, VRAM_МБ)}} — усі обчислювальні процеси NVIDIA."""
+def nvidia_apps():
+    """{pci: {pid: (назва, VRAM_МБ)}} — усі процеси NVIDIA з VRAM:
+    обчислювальні (C/C+G) та графічні OpenGL/EGL-контексти (G)."""
     res = {}
     if not shutil.which("nvidia-smi"):
         return res
@@ -136,22 +137,20 @@ def nvidia_compute_apps():
             pci = norm_pci(p[1])
             if pci:
                 idx_to_pci[p[0]] = pci
-    for idx, pci in idx_to_pci.items():
-        out = run(["nvidia-smi", f"--id={idx}", "--query-compute-apps=pid,process_name,used_memory",
-                   "--format=csv,noheader"])
-        for line in out.splitlines():
-            p = [x.strip() for x in line.split(",")]
-            if len(p) != 3:
-                continue
-            pid, name, used = p
-            m = re.search(r"([0-9]+(?:\.[0-9]+)?)", used)
-            if not m:
-                continue
-            mb = float(m.group(1))
-            d = res.setdefault(pci, {})
-            short = name.split("/")[-1] or "?"
-            prev = d.get(pid)
-            d[pid] = (prev[0], prev[1] + mb) if prev else (short, mb)
+    row_re = re.compile(r"^\|\s*(\d+)\s+N/A\s+N/A\s+(\d+)\s+(?:C\+G|C|G)\s+(.+?)\s+([0-9]+)MiB\s*\|$")
+    for line in run(["nvidia-smi"]).splitlines():
+        m = row_re.match(line)
+        if not m:
+            continue
+        idx, pid, name, used = m.groups()
+        pci = idx_to_pci.get(idx)
+        if not pci:
+            continue
+        mb = float(used)
+        short = read(f"/proc/{pid}/comm", "") or name.split("/")[-1] or "?"
+        d = res.setdefault(pci, {})
+        prev = d.get(pid)
+        d[pid] = (prev[0], prev[1] + mb) if prev else (short, mb)
     return res
 
 
@@ -208,7 +207,7 @@ def vram_processes():
     """{pci: [(pid, назва, VRAM_МБ)]} для обох карт.
 
     amdgpu/nouveau/i915 — з /proc/*/fdinfo (без root видно лише власні процеси);
-    NVIDIA — через nvidia-smi (усі обчислювальні процеси)."""
+    NVIDIA — через nvidia-smi (усі: обчислювальні та OpenGL/EGL-контексти)."""
     per_pci = {}
     for pdir in glob.glob("/proc/[0-9]*"):
         pid = int(os.path.basename(pdir))
@@ -239,7 +238,7 @@ def vram_processes():
             d = per_pci.setdefault(pci, {})
             d[pid] = d.get(pid, 0) + mb
 
-    for pci, apps in nvidia_compute_apps().items():
+    for pci, apps in nvidia_apps().items():
         d = per_pci.setdefault(pci, {})
         for pid, (name, mb) in apps.items():
             d[pid] = d.get(pid, 0) + mb
@@ -249,27 +248,6 @@ def vram_processes():
         out[pci] = sorted(((int(pid), read(f"/proc/{pid}/comm", "?"), mb) for pid, mb in d.items()),
                           key=lambda x: -x[2])
     return out
-
-
-def nvidia_gl_holders():
-    """Назви процесів з відкритими /dev/nvidiaN (OpenGL/EGL-контексти;
-    VRAM драйвер NVIDIA не атрибутує по процесах)."""
-    names = set()
-    for pdir in glob.glob("/proc/[0-9]*"):
-        pid = os.path.basename(pdir)
-        try:
-            fds = os.listdir(f"{pdir}/fd")
-        except OSError:
-            continue
-        for fd in fds:
-            try:
-                tgt = os.readlink(f"{pdir}/fd/{fd}")
-            except OSError:
-                continue
-            if re.fullmatch(r"/dev/nvidia\d+", tgt):
-                names.add(read(f"/proc/{pid}/comm", "?"))
-                break
-    return sorted(names)
 
 
 def set_output(name, enable):
@@ -415,7 +393,7 @@ class App(QWidget):
         root.addLayout(self.container)
 
         # ---- процеси у VRAM
-        pbox = QGroupBox("Процеси, що тримають VRAM (NVIDIA — усі обчислювальні; "
+        pbox = QGroupBox("Процеси, що тримають VRAM (NVIDIA — усі, включно з OpenGL/EGL; "
                          "AMD — лише ваші без root)")
         proot = QVBoxLayout(pbox)
         self.tree = QTreeWidget()
@@ -455,7 +433,6 @@ class App(QWidget):
         self.restore_after_game = False
         self.root_procs = None
         self.root_ts = 0.0
-        self.root_nvgl = []
 
         self._theme = self._build_theme()
         self.setStyleSheet(self._qss())
@@ -735,9 +712,7 @@ class App(QWidget):
         except ValueError:
             self.set_status("Не вдалося прочитати результат root-сканування", "warn")
             return None
-        procs = data["procs"] if isinstance(data, dict) and "procs" in data else data
-        self.root_nvgl = data.get("nv_gl", []) if isinstance(data, dict) else []
-        self.root_procs, self.root_ts = procs, time.monotonic()
+        self.root_procs, self.root_ts = data, time.monotonic()
         self.set_status(f"Повний список отримано (root), свіжий {self.ROOT_TTL // 60} хв.", "ok")
         return data
 
@@ -773,12 +748,10 @@ class App(QWidget):
             listed = sum(mb for _, _, mb in procs.get(pci, []))
             diff = g["used"] - listed
             if diff > 8:
-                if root_on and g["vendor"] == "NVIDIA" and self.root_nvgl:
-                    note = f"OpenGL/EGL-контексти ({', '.join(self.root_nvgl[:3])})"
-                elif root_on:
-                    note = "інші контексти (не атрибутовано)"
-                else:
+                if not root_on and g["vendor"] != "NVIDIA":
                     note = "інші (не видно без root)"
+                else:
+                    note = "не атрибутовано (ядро/драйвер)"
                 item = QTreeWidgetItem([names.get(pci, pci), note, "—", f"{diff:.0f}"])
                 item.setTextAlignment(2, Qt.AlignmentFlag.AlignRight)
                 item.setTextAlignment(3, Qt.AlignmentFlag.AlignRight)
@@ -929,7 +902,7 @@ class App(QWidget):
 if __name__ == "__main__":
     if "--procs-json" in sys.argv:
         # Режим для root-сканування (pkexec): виводить JSON процесів у VRAM і завершується.
-        print(json.dumps({"procs": vram_processes(), "nv_gl": nvidia_gl_holders()}))
+        print(json.dumps(vram_processes()))
         sys.exit(0)
     app = QApplication(sys.argv)
     w = App()
