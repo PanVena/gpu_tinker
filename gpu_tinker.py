@@ -110,17 +110,17 @@ def short_name(full):
 
 
 def nvidia_stats():
-    """{'0000:04:00.0': {used,total,util,temp,power}}"""
+    """{'0000:04:00.0': {name,used,total,util,temp,power}}"""
     res = {}
-    q = "pci.bus_id,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw"
+    q = "pci.bus_id,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw"
     for line in run(["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits"]).splitlines():
         p = [x.strip() for x in line.split(",")]
-        if len(p) == 6:
+        if len(p) == 7:
             pci = norm_pci(p[0])
             if pci:
                 res[pci] = {
-                    "used": to_int(p[1]), "total": to_int(p[2]),
-                    "util": to_float(p[3]), "temp": to_float(p[4]), "power": to_float(p[5])}
+                    "name": p[1], "used": to_int(p[2]), "total": to_int(p[3]),
+                    "util": to_float(p[4]), "temp": to_float(p[5]), "power": to_float(p[6])}
     return res
 
 
@@ -154,6 +154,31 @@ def nvidia_apps():
     return res
 
 
+def amdgpu_names():
+    """{pci: точна назва GPU} через amdgpu_top -d -J (якщо встановлено)."""
+    res = {}
+    if not shutil.which("amdgpu_top"):
+        return res
+    try:
+        r = subprocess.run(["amdgpu_top", "-d", "-J"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return res
+    if r.returncode != 0:
+        return res
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        return res
+    for dev in data if isinstance(data, list) else [data]:
+        if not isinstance(dev, dict):
+            continue
+        pci = norm_pci(str(dev.get("PCI", "")))
+        name = dev.get("DeviceName")
+        if pci and name:
+            res[pci] = str(name)
+    return res
+
+
 def hwmon_value(dev, names, scale):
     for n in names:
         for path in glob.glob(f"{dev}/hwmon/hwmon*/{n}"):
@@ -176,6 +201,8 @@ def scan():
         driver = (os.path.basename(os.path.realpath(f"{dev}/driver"))
                   if os.path.exists(f"{dev}/driver") else "—")
         name = gpu_name(pci)
+        if vendor == "AMD":  # lspci дає неоднозначну назву (XT/XTX/GRE), беремо точну
+            name = amdgpu_names().get(pci, name)
         g = {"card": card, "pci": pci, "vendor": vendor, "driver": driver,
              "name": name, "short": short_name(name),
              "used": None, "total": None, "util": None,
@@ -192,7 +219,10 @@ def scan():
         elif vendor == "NVIDIA" and shutil.which("nvidia-smi"):
             if nv is None:
                 nv = nvidia_stats()
-            g.update(nv.get(pci, {}))
+            st = nv.get(pci, {})
+            g.update(st)
+            if st.get("name"):  # точна назва від nvidia-smi
+                g["short"] = short_name(st["name"])
 
         conns = []
         for c in sorted(glob.glob(f"{DRM}/{card}-*")):
@@ -629,7 +659,7 @@ class App(QWidget):
 
     def fill_combo(self):
         def item(g):
-            vram = f" · {g['total'] // 1024} ГБ" if g["total"] else ""
+            vram = f" · {round(g['total'] / 1024)} ГБ" if g["total"] else ""
             return f"{g['short']}{vram} ({g['card']})"
 
         self.combo_map = [(g["pci"], item(g)) for g in self.data]
