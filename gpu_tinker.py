@@ -3,7 +3,9 @@
 обраної карти від робочого столу (KDE Plasma, Wayland).
 
 Панелі карток показують активні режими моніторів;
-AMD — керування вентилятором, NVIDIA — ліміт потужності (root — вбуданий діалог KDE).
+AMD — керування вентилятором, NVIDIA — ліміт потужності (root — вбуданий діалог KDE),
+Intel — метрики через intel_gpu_top (якщо встановлено; без root часто потрібен
+CAP_PERFMON/paranoid<2, тоді — вбуданий діалог KDE).
 
 Панель «Звільнити карту» має два незалежні чекбокси:
   1. Вимкнути монітори обраної карти — діє одразу, без виходу з сесії.
@@ -12,16 +14,21 @@ AMD — керування вентилятором, NVIDIA — ліміт по�
      (робочий стіл) на наступному вході в сесію малює на іншій карті.
 
 Панель «Запустити гру» запускає обрану команду на обраній карті:
-  - Vulkan-ігри — GPU встановлюється через VK_ICD_VENDOR=allow_amd|allow_nvidia;
-  - OpenGL на NVIDIA — через __NV_PRIME_PROFILE (X11);
+  - Vulkan-ігри — GPU фіксується через VK_LOADER_VENDOR_ID_FILTER
+    (Intel 0x8086, AMD 0x1002, NVIDIA 0x10de; loader >= 1.4.326);
+  - OpenGL/EGL обмежень по вендору не мають;
   - опційно вимикає монітори інших карт і повертає їх після завершення гри.
 
 Процеси у VRAM: для AMD/Nouveau/Intel читаються з /proc/*/fdinfo
-(без root видно лише власні процеси), для NVIDIA — через nvidia-smi
-(усі процеси, включно з OpenGL/EGL-контекстами).
+(без root видно лише власні процеси; для i915 — resident-пам'ять по регіонах
+system/stolen), для NVIDIA — через nvidia-smi (усі процеси, включно з
+OpenGL/EGL-контекстами).
 
 Залежності: python3-pyside6, pciutils (lspci), kscreen (kscreen-doctor).
 Для NVIDIA додатково використовується nvidia-smi, якщо він є.
+Для Intel метрик — intel_gpu_top (пакет intel-gpu-tools), якщо встановлено.
+При запусці програма питає про відсутні інструменти і може встановити обране
+через пакетний менеджер (root — діалог KDE).
 """
 import glob
 import json
@@ -38,8 +45,9 @@ from collections import deque
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPalette
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QGroupBox,
-                                QHeaderView,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
+                                QGroupBox,
+                               QHeaderView,
                                QHBoxLayout, QLabel, QLineEdit, QMessageBox,
                                QProgressBar, QPushButton, QSlider, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
@@ -47,8 +55,10 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QGroupBox,
 DRM = "/sys/class/drm"
 ENV_FILE = os.path.expanduser("~/.config/plasma-workspace/env/gpu-ai-mode.sh")
 VENDORS = {"0x1002": "AMD", "0x10de": "NVIDIA", "0x8086": "Intel"}
+VK_VENDOR_IDS = {"AMD": "0x1002", "NVIDIA": "0x10de", "Intel": "0x8086"}  # VK_LOADER_VENDOR_ID_FILTER
 REFRESH_MS = 2000
 PROCS_MS = 4000
+INTEL_MS = 5000
 UNITS = {"B": 1 / 2**20, "KiB": 1 / 1024, "MiB": 1, "GiB": 1024}
 
 
@@ -226,6 +236,64 @@ def amdgpu_names():
     return res
 
 
+def intel_top_cmd(card, n=True, secs=8):
+    """Команда для одного зразка `intel_gpu_top -J` карти card.
+
+    -n 1 — чистий вихід після одного зразка (коректний JSON); старі версії
+    не мають -n, тоді timeout обриває стрим і парситься перший повний об'єкт."""
+    top = shutil.which("intel_gpu_top")
+    t = shutil.which("timeout") or "/usr/bin/timeout"
+    cmd = [t, str(secs), top, "-J", "-d", f"drm:/dev/dri/{card}"]
+    if n:
+        cmd += ["-n", "1"]
+    return cmd
+
+
+def intel_sample(cmd):
+    """Перший JSON-зразок `intel_gpu_top -J` як dict; None — не вдалося."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = r.stdout or ""
+    i = out.find("{")
+    if i < 0:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(out[i:])
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def intel_metrics(sample):
+    """{'util': %, 'freq': МГц, 'power': Вт, 'bw': (read, write, unit)} з JSON-зразка."""
+    m = {}
+    busy = [to_float(e.get("busy")) for e in (sample.get("engines") or {}).values()
+            if isinstance(e, dict)]
+    busy = [b for b in busy if b is not None]
+    if busy:
+        m["util"] = max(busy)
+    f = sample.get("frequency") or {}
+    freq = to_float(f.get("actual"))
+    if freq is None:
+        freq = to_float(f.get("requested"))
+    if freq is not None:
+        m["freq"] = freq
+    p = sample.get("power") or {}
+    pw = to_float(p.get("GPU"))
+    if pw is None:
+        pw = to_float(p.get("Package"))
+    if pw is not None:
+        m["power"] = pw
+    imc = sample.get("imc-bandwidth") or {}
+    rd, wr = to_float(imc.get("reads")), to_float(imc.get("writes"))
+    unit = str(imc.get("unit") or "").strip()
+    if rd is not None and wr is not None:
+        m["bw"] = (rd, wr, unit)
+    return m
+
+
 def hwmon_value(dev, names, scale):
     for n in names:
         for path in glob.glob(f"{dev}/hwmon/hwmon*/{n}"):
@@ -287,7 +355,8 @@ def scan():
 def vram_processes():
     """{pci: [(pid, назва, VRAM_МБ)]} для обох карт.
 
-    amdgpu/nouveau/i915 — з /proc/*/fdinfo (без root видно лише власні процеси);
+    amdgpu/nouveau — з /proc/*/fdinfo (drm-memory-vram); i915 — resident-пам'ять
+    по регіонах (system/stolen/local); без root видно лише власні процеси;
     NVIDIA — через nvidia-smi (усі: обчислювальні та OpenGL/EGL-контексти)."""
     per_pci = {}
     for pdir in glob.glob("/proc/[0-9]*"):
@@ -314,6 +383,10 @@ def vram_processes():
             mb = 0.0
             if m_v:
                 mb = int(m_v.group(1)) * UNITS.get(m_v.group(2) or "KiB", 1 / 1024)
+            else:
+                # i915: drm-memory-vram немає — пам'ять лічується по регіонах (system/stolen/local)
+                for m_r in re.finditer(r"^drm-resident-\S+:\s*(\d+)\s*(\w+)?", txt, re.M):
+                    mb += int(m_r.group(1)) * UNITS.get(m_r.group(2) or "KiB", 1 / 1024)
             seen[(pci, m_id.group(1) if m_id else fd)] = mb
         for (pci, _), mb in seen.items():
             d = per_pci.setdefault(pci, {})
@@ -410,6 +483,86 @@ def logout():
         subprocess.run(["loginctl", "terminate-session", os.environ["XDG_SESSION_ID"]])
 
 
+def missing_deps(gpus):
+    """[(пакет, інструмент, опис)] — не встановлені інструменти, без яких
+    функціональність програми обмежена (залежно від виявлених карт)."""
+    deps = []
+    if not shutil.which("kscreen-doctor"):
+        deps.append(("kscreen", "kscreen-doctor", "вмикання/вимикання моніторів"))
+    if not shutil.which("lspci"):
+        deps.append(("pciutils", "lspci", "назви GPU"))
+    for g in gpus:
+        if g["vendor"] == "NVIDIA" and not shutil.which("nvidia-smi"):
+            deps.append(("nvidia", "nvidia-smi", "метрики та процеси NVIDIA (пропрієтарний драйвер)"))
+            break
+    for g in gpus:
+        if g["vendor"] == "Intel" and not shutil.which("intel_gpu_top"):
+            deps.append(("intel-gpu-tools", "intel_gpu_top", "метрики Intel"))
+            break
+    return deps
+
+
+class DepsDialog(QDialog):
+    """Стартовий діалог: вибір, які відсутні інструменти встановити."""
+
+    def __init__(self, parent, deps):
+        super().__init__(parent)
+        self.setWindowTitle("Відсутні інструменти")
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel(
+            "Не встановлено інструменти, без яких функціональність обмежена\n"
+            "(монітори, метрики GPU, процеси у VRAM). Оберіть, що встановити:"))
+        self.checks = {}
+        for pkg, tool, desc in deps:
+            chk = QCheckBox(f"{tool} — {desc} (пакет: {pkg})")
+            chk.setChecked(True)
+            self.checks[pkg] = chk
+            root.addWidget(chk)
+        row = QHBoxLayout()
+        btn = QPushButton("Встановити обране (root — діалог KDE)")
+        btn.clicked.connect(self.accept)
+        row.addWidget(btn)
+        row.addStretch(1)
+        cancel = QPushButton("Скасувати")
+        cancel.clicked.connect(self.reject)
+        row.addWidget(cancel)
+        root.addLayout(row)
+
+    def selected(self):
+        return [p for p, c in self.checks.items() if c.isChecked()]
+
+
+def install_packages(pkgs):
+    """Встановити пакети через пакетний менеджер (root — діалог KDE). True/False."""
+    pm, args = None, []
+    for name, a in (("dnf", ["install", "-y"]), ("yum", ["install", "-y"]),
+                    ("apt-get", ["install", "-y"]),
+                    ("zypper", ["install", "--non-interactive"])):
+        if shutil.which(name):
+            pm, args = name, a
+            break
+    if not pm:
+        QMessageBox.critical(None, "Не вдалося встановити",
+                             "Не знайдено жодного пакетного менеджера (dnf/yum/apt/zypper).")
+        return False
+    cmd = ["pkexec", pm] + args + pkgs
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.SubprocessError) as e:
+        QMessageBox.critical(None, "Не вдалося встановити", str(e))
+        return False
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout).strip()
+        if not err:  # відмова/скасування у діалозі KDE — без текстової помилки
+            QMessageBox.information(None, "Скасовано", "Встановлення скасовано.")
+        else:
+            tail = "\n".join(err.splitlines()[-5:])
+            QMessageBox.critical(None, "Не вдалося встановити", f"{pm} повернула помилку:\n{tail}")
+        return False
+    QMessageBox.information(None, "Установлено", "Установлено: " + ", ".join(pkgs))
+    return True
+
+
 # ------------------------------------------------------------------ GUI
 class App(QWidget):
     def __init__(self):
@@ -490,7 +643,8 @@ class App(QWidget):
         glaunch.addStretch()
         gr.addLayout(glaunch)
         gnote = QLabel(
-            "GPU задається через VK_ICD_VENDOR / __NV_PRIME_PROFILE; монітори повернуться після гри.")
+            "Vulkan-гри фіксуються на карті через VK_LOADER_VENDOR_ID_FILTER (Intel/AMD/NVIDIA); "
+            "OpenGL/EGL обмежень по вендору не мають. Монітори повернуться після гри.")
         gnote.setWordWrap(True)
         gnote.setObjectName("desc")
         gr.addWidget(gnote)
@@ -546,10 +700,9 @@ class App(QWidget):
         self._theme = self._build_theme()
         self.setStyleSheet(self._qss())
 
-        if not shutil.which("kscreen-doctor"):
-            QMessageBox.warning(self, "kscreen-doctor не знайдено",
-                                "Без kscreen-doctor монітори не вимикатимуться.\n"
-                                "Встановіть: sudo dnf install kscreen")
+        if not shutil.which("kscreen-doctor"):  # на старті вже пропонували встановити
+            self.set_status("kscreen-doctor не встановлено — монітори не вимикатимуться "
+                           "(пакет kscreen)", "warn")
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
@@ -557,6 +710,11 @@ class App(QWidget):
         self.timer_procs = QTimer(self)
         self.timer_procs.timeout.connect(self.refresh_procs)
         self.timer_procs.start(PROCS_MS)
+        self.intel_cache = {}          # останні метрики intel_gpu_top по картах
+        self._intel_hinted = False     # підказку про CAP_PERFMON показуємо один раз
+        self.timer_intel = QTimer(self)
+        self.timer_intel.timeout.connect(self.tick_intel)
+        self.timer_intel.start(INTEL_MS)
         self.tick()
         self.refresh_procs()
 
@@ -667,6 +825,9 @@ class App(QWidget):
                 pct = 100 * g["used"] / g["total"]
                 w["vram"].setText(f"VRAM: {g['used']} / {g['total']} МБ ({pct:.0f}%)")
                 w["bar"].setValue(int(pct))
+            elif g["vendor"] == "Intel":  # i915: без власного VRAM, спільна RAM системи
+                w["vram"].setText("VRAM: спільна з RAM системи")
+                w["bar"].setValue(0)
             else:
                 w["vram"].setText("VRAM: недоступно")
                 w["bar"].setValue(0)
@@ -680,8 +841,11 @@ class App(QWidget):
             if g["rt"]:
                 parts.append(f"стан: {g['rt']}")
             w["metrics"].setText(" · ".join(parts) or "метрики недоступні")
+            util = g["util"]
+            if util is None and g["vendor"] == "Intel":
+                util = (self.intel_cache.get(g["card"]) or {}).get("util")  # з intel_gpu_top
             w["util_bar"].setValue(
-                int(max(0.0, min(100.0, g["util"]))) if g["util"] is not None else 0)
+                int(max(0.0, min(100.0, util))) if util is not None else 0)
             if w.get("fan_lbl") is not None and g.get("fan") is not None:
                 tgt = g.get("fan_target")
                 extra = f" (ціль {tgt:.0f} об/хв)" if tgt else " (авто)"
@@ -756,6 +920,15 @@ class App(QWidget):
                 pr.addWidget(pb)
                 v.addLayout(pr)
                 w["pwr_slider"] = sld
+            if g["vendor"] == "Intel":
+                ir = QHBoxLayout()
+                w["intel_lbl"] = QLabel("Метрики: запитати через intel_gpu_top")
+                ir.addWidget(w["intel_lbl"])
+                ir.addStretch(1)
+                ib = QPushButton("Оновити метрики (root, якщо треба)")
+                ib.clicked.connect(lambda _=False, c=card: self.refresh_intel_metrics(c))
+                ir.addWidget(ib)
+                v.addLayout(ir)
             if not g["conns"]:
                 v.addWidget(QLabel("Підключених моніторів немає"))
             for cname, _ in g["conns"]:
@@ -970,6 +1143,98 @@ class App(QWidget):
             err = (r.stderr or r.stdout).strip().splitlines()
             self.set_status(f"Не вдалося встановити ліміт ({err[0][:80] if err else 'помилка'})", "warn")
 
+    # ---- метрики Intel (intel_gpu_top)
+    def refresh_intel_metrics(self, card):
+        g = next((x for x in self.data if x["card"] == card), None)
+        w = self.widgets.get(card, {})
+        if not g or "intel_lbl" not in w:
+            return
+        if not shutil.which("intel_gpu_top"):
+            self.set_status("intel_gpu_top не встановлено — метрики недоступні. "
+                            "Встановіть: sudo dnf install intel-gpu-tools", "warn")
+            return
+        self.set_status(f"Читаємо метрики {g['short']} (intel_gpu_top)…")
+        sample = intel_sample(intel_top_cmd(card))
+        if sample is None:  # старі версії без -n — timeout обриває стрим, парсимо перший зразок
+            sample = intel_sample(intel_top_cmd(card, n=False, secs=5))
+        if sample is None and shutil.which("setcap"):
+            # Без root зазвичай блокує perf_event_paranoid/CAP_PERFMON: разово надаємо
+            # CAP_PERFMON бінарнику (root — діалог KDE), далі метрики читаються без root.
+            r = self._pkexec(["pkexec", "setcap", "cap_perfmon+ep", shutil.which("intel_gpu_top")])
+            if r is not None and r.returncode == 0:
+                sample = intel_sample(intel_top_cmd(card))
+                if sample is None:
+                    sample = intel_sample(intel_top_cmd(card, n=False, secs=5))
+                if sample is not None:
+                    self.set_status("CAP_PERFMON надано — далі метрики читаються без root", "ok")
+        if sample is None:
+            # Якщо setcap не допомогло — повне root-виконання (діалог KDE)
+            r = self._pkexec(["pkexec"] + intel_top_cmd(card))
+            if r is None:
+                return
+            out = r.stdout or ""
+            i = out.find("{")
+            sample = None
+            if i >= 0:
+                try:
+                    obj, _ = json.JSONDecoder().raw_decode(out[i:])
+                    sample = obj if isinstance(obj, dict) else None
+                except ValueError:
+                    pass
+            if sample is None:
+                err = (r.stderr or "").strip().splitlines()
+                self.set_status(f"intel_gpu_top не дав даних ({err[0][:80] if err else 'помилка'})", "warn")
+                return
+        m = intel_metrics(sample)
+        if not m:
+            self.set_status("intel_gpu_top не дав жодних метрик", "warn")
+            return
+        self.intel_cache[card] = m
+        self._apply_intel_metrics(g, w, m)
+        self.set_status(f"Метрики {g['short']}: " + w["intel_lbl"].text(), "ok")
+
+    def _apply_intel_metrics(self, g, w, m):
+        """Оновити рядок метрик Intel і бар заповненості."""
+        parts = []
+        if m.get("util") is not None:
+            parts.append(f"Навантаження: {m['util']:.0f}%")
+        if m.get("freq") is not None:
+            parts.append(f"{m['freq']:.0f} МГц")
+        if m.get("power") is not None:
+            parts.append(f"{m['power']:.1f} Вт")
+        bw = m.get("bw")
+        if bw:
+            rd, wr, unit = bw
+            parts.append(f"ПАМ: {rd:.0f}/{wr:.0f} {unit}")
+        w["intel_lbl"].setText(" · ".join(parts) or "метрики: —")
+        if m.get("util") is not None:
+            w["util_bar"].setValue(int(max(0.0, min(100.0, m["util"]))))
+
+    def tick_intel(self):
+        """Автоматичне читання метрик Intel кожні INTEL_MS без root (CAP_PERFMON)."""
+        if not shutil.which("intel_gpu_top"):
+            return
+        for g in self.data:
+            if g["vendor"] != "Intel":
+                continue
+            w = self.widgets.get(g["card"], {})
+            if "intel_lbl" not in w:
+                continue
+            sample = intel_sample(intel_top_cmd(g["card"]))
+            if sample is None:
+                # без CAP_PERFMON не читаємо — діалогами не спамимо, підказка один раз
+                if not self._intel_hinted:
+                    self.set_status("Метрики Intel не читаються без root — натисніть "
+                                   "«Оновити метрики» (разовий діалог KDE видасть CAP_PERFMON)",
+                                   "warn")
+                    self._intel_hinted = True
+                continue
+            m = intel_metrics(sample)
+            if not m:
+                continue
+            self.intel_cache[g["card"]] = m
+            self._apply_intel_metrics(g, w, m)
+
     # ---- дії над моніторами
     def enabled_outputs(self):
         return [n for g in self.data for n, e in g["conns"] if e]
@@ -1086,9 +1351,9 @@ class App(QWidget):
             if not self.change(others_on, False):
                 return
         env = dict(os.environ)
-        vendor = g["vendor"].lower()
-        if vendor in ("amd", "nvidia"):
-            env["VK_ICD_VENDOR"] = f"allow_{vendor}"
+        vid = VK_VENDOR_IDS.get(g["vendor"])
+        if vid:  # Vulkan-лоадер (>= 1.4.326): фіксує GPU за вендором; OpenGL/EGL не підпорядковується
+            env["VK_LOADER_VENDOR_ID_FILTER"] = vid
         if g["vendor"] == "NVIDIA":
             env["__NV_PRIME_PROFILE"] = "pci:" + ":".join(g["pci"].split(":")[1:])
         try:
@@ -1122,6 +1387,13 @@ if __name__ == "__main__":
         print(json.dumps(vram_processes()))
         sys.exit(0)
     app = QApplication(sys.argv)
+    deps = missing_deps(scan())  # стартовий діалог: що встановити з відсутнього
+    if deps:
+        dlg = DepsDialog(None, deps)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            pkgs = dlg.selected()
+            if pkgs:
+                install_packages(pkgs)
     w = App()
     w.show()
     sys.exit(app.exec())
