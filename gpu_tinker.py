@@ -13,16 +13,11 @@ CAP_PERFMON/paranoid<2, тоді — вбуданий діалог KDE).
      ~/.config/plasma-workspace/env/gpu-ai-mode.sh, після чого KWin
      (робочий стіл) на наступному вході в сесію малює на іншій карті.
 
-Панель «Запустити гру» запускає обрану команду на обраній карті:
-  - Vulkan-ігри — GPU фіксується через VK_LOADER_VENDOR_ID_FILTER
-    (Intel 0x8086, AMD 0x1002, NVIDIA 0x10de; loader >= 1.4.326);
-  - OpenGL/EGL обмежень по вендору не мають;
-  - опційно вимикає монітори інших карт і повертає їх після завершення гри.
-
 Процеси у VRAM: для AMD/Nouveau/Intel читаються з /proc/*/fdinfo
 (без root видно лише власні процеси; для i915 — resident-пам'ять по регіонах
 system/stolen), для NVIDIA — через nvidia-smi (усі процеси, включно з
-OpenGL/EGL-контекстами).
+OpenGL/EGL-контекстами). Завантаження процесів: DRM engine-time з fdinfo,
+для NVIDIA — SM utilization через nvidia-smi pmon.
 
 Залежності: python3-pyside6, pciutils (lspci), kscreen (kscreen-doctor).
 Для NVIDIA додатково використовується nvidia-smi, якщо він є.
@@ -35,27 +30,23 @@ import json
 import os
 import re
 import time
-import shlex
 import shutil
 import signal
 import subprocess
 import sys
 
-from collections import deque
-
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QProcess, Qt, QTimer
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                                 QGroupBox,
                                QHeaderView,
-                               QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+                               QHBoxLayout, QLabel, QMessageBox,
                                QProgressBar, QPushButton, QSlider, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 DRM = "/sys/class/drm"
 ENV_FILE = os.path.expanduser("~/.config/plasma-workspace/env/gpu-ai-mode.sh")
 VENDORS = {"0x1002": "AMD", "0x10de": "NVIDIA", "0x8086": "Intel"}
-VK_VENDOR_IDS = {"AMD": "0x1002", "NVIDIA": "0x10de", "Intel": "0x8086"}  # VK_LOADER_VENDOR_ID_FILTER
 REFRESH_MS = 2000
 PROCS_MS = 4000
 INTEL_MS = 5000
@@ -161,6 +152,19 @@ def nvidia_index(pci):
     return None
 
 
+def nvidia_pci_map():
+    """{індекс nvidia-smi: PCI-адреса}."""
+    res = {}
+    for line in run(["nvidia-smi", "--query-gpu=index,pci.bus_id",
+                     "--format=csv,noheader"]).splitlines():
+        p = [x.strip() for x in line.split(",")]
+        if len(p) == 2:
+            pci = norm_pci(p[1])
+            if pci:
+                res[p[0]] = pci
+    return res
+
+
 def kscreen_modes():
     """{назва виходу: активний режим, напр. '2560×1440@60'} через kscreen-doctor -o."""
     out = run(["kscreen-doctor", "-o"], timeout=10)
@@ -187,13 +191,7 @@ def nvidia_apps():
     res = {}
     if not shutil.which("nvidia-smi"):
         return res
-    idx_to_pci = {}
-    for line in run(["nvidia-smi", "--query-gpu=index,pci.bus_id", "--format=csv,noheader"]).splitlines():
-        p = [x.strip() for x in line.split(",")]
-        if len(p) == 2:
-            pci = norm_pci(p[1])
-            if pci:
-                idx_to_pci[p[0]] = pci
+    idx_to_pci = nvidia_pci_map()
     row_re = re.compile(r"^\|\s*(\d+)\s+N/A\s+N/A\s+(\d+)\s+(?:C\+G|C|G)\s+(.+?)\s+([0-9]+)MiB\s*\|$")
     for line in run(["nvidia-smi"]).splitlines():
         m = row_re.match(line)
@@ -352,13 +350,14 @@ def scan():
     return gpus
 
 
-def vram_processes():
-    """{pci: [(pid, назва, VRAM_МБ)]} для обох карт.
+def vram_processes(with_engine_times=False):
+    """Процеси у VRAM; за потреби повертає також накопичені часи GPU-движків.
 
     amdgpu/nouveau — з /proc/*/fdinfo (drm-memory-vram); i915 — resident-пам'ять
     по регіонах (system/stolen/local); без root видно лише власні процеси;
     NVIDIA — через nvidia-smi (усі: обчислювальні та OpenGL/EGL-контексти)."""
     per_pci = {}
+    process_engine_times = {}
     for pdir in glob.glob("/proc/[0-9]*"):
         pid = int(os.path.basename(pdir))
         try:
@@ -387,10 +386,19 @@ def vram_processes():
                 # i915: drm-memory-vram немає — пам'ять лічується по регіонах (system/stolen/local)
                 for m_r in re.finditer(r"^drm-resident-\S+:\s*(\d+)\s*(\w+)?", txt, re.M):
                     mb += int(m_r.group(1)) * UNITS.get(m_r.group(2) or "KiB", 1 / 1024)
-            seen[(pci, m_id.group(1) if m_id else fd)] = mb
-        for (pci, _), mb in seen.items():
+            engine_times = {}
+            for m_engine in re.finditer(
+                    r"^drm-engine-([^\s:]+):\s*(\d+)(?:\s*(\w+))?", txt, re.M):
+                unit = m_engine.group(3) or "ns"
+                if unit in ("ns", "nsec"):
+                    engine_times[m_engine.group(1)] = int(m_engine.group(2))
+            seen[(pci, m_id.group(1) if m_id else fd)] = (mb, engine_times)
+        for (pci, _), (mb, engine_times) in seen.items():
             d = per_pci.setdefault(pci, {})
             d[pid] = d.get(pid, 0) + mb
+            engines = process_engine_times.setdefault((pci, pid), {})
+            for engine, elapsed_ns in engine_times.items():
+                engines[engine] = engines.get(engine, 0) + elapsed_ns
 
     for pci, apps in nvidia_apps().items():
         d = per_pci.setdefault(pci, {})
@@ -401,7 +409,52 @@ def vram_processes():
     for pci, d in per_pci.items():
         out[pci] = sorted(((int(pid), read(f"/proc/{pid}/comm", "?"), mb) for pid, mb in d.items()),
                           key=lambda x: -x[2])
-    return out
+    return (out, process_engine_times) if with_engine_times else out
+
+
+_PROCESS_ENGINE_PREVIOUS = {}
+_PROCESS_ENGINE_SAMPLE_AT = None
+
+
+def process_engine_utilization(engine_times, now=None):
+    """Процесний % GPU за приростом DRM engine-time між двома зразками."""
+    global _PROCESS_ENGINE_PREVIOUS, _PROCESS_ENGINE_SAMPLE_AT
+    now = time.monotonic() if now is None else now
+    previous, previous_at = _PROCESS_ENGINE_PREVIOUS, _PROCESS_ENGINE_SAMPLE_AT
+    _PROCESS_ENGINE_PREVIOUS = engine_times
+    _PROCESS_ENGINE_SAMPLE_AT = now
+    if previous_at is None:
+        return {}
+    interval_ns = (now - previous_at) * 1_000_000_000
+    if interval_ns <= 0:
+        return {}
+
+    utilization = {}
+    for key, engines in engine_times.items():
+        old_engines = previous.get(key)
+        if old_engines is None:
+            continue
+        deltas = [value - old_engines[engine] for engine, value in engines.items()
+                  if engine in old_engines]
+        if not deltas or any(delta < 0 for delta in deltas):
+            continue
+        utilization[key] = min(100.0, sum(deltas) * 100 / interval_ns)
+    return utilization
+
+
+def nvidia_process_utilization(output, idx_to_pci):
+    """{(pci, pid): SM utilization %} з одного зразка `nvidia-smi pmon`."""
+    utilization = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 4 or not fields[0].isdigit() or not fields[1].isdigit():
+            continue
+        pci = idx_to_pci.get(fields[0])
+        sm = to_float(fields[3])
+        if pci and sm is not None:
+            key = (pci, int(fields[1]))
+            utilization[key] = max(utilization.get(key, 0.0), min(100.0, sm))
+    return utilization
 
 
 def set_output(name, enable):
@@ -577,7 +630,6 @@ class App(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
-        top_row = QHBoxLayout()
 
         # ---- панель «звільнити карту»
         box = QGroupBox("Звільнити карту для обчислень")
@@ -613,60 +665,31 @@ class App(QWidget):
         self.mode_label = QLabel()
         self.mode_label.setWordWrap(True)
         broot.addWidget(self.mode_label)
-        top_row.addWidget(box, 1)
-
-        # ---- панель запуску гри на обраній карті
-        gbox = QGroupBox("Запустити гру на окремій відеокарті")
-        gr = QVBoxLayout(gbox)
-        grow = QHBoxLayout()
-        self.edit_cmd = QLineEdit()
-        self.edit_cmd.setPlaceholderText("Команда або шлях до гри, напр.: steam -app 1203960")
-        grow.addWidget(QLabel("Команда:"))
-        grow.addWidget(self.edit_cmd, 1)
-        gr.addLayout(grow)
-        grow2 = QHBoxLayout()
-        grow2.addWidget(QLabel("Цільова карта:"))
-        self.combo_game = QComboBox()
-        grow2.addWidget(self.combo_game, 1)
-        gr.addLayout(grow2)
-        self.chk_other_off = QCheckBox("Вимкнути монітори інших карт")
-        lbl_other = QLabel("(гра буде видно лише на екранах цієї карти)")
-        lbl_other.setObjectName("desc")
-        r3 = QHBoxLayout()
-        r3.addWidget(self.chk_other_off)
-        r3.addWidget(lbl_other)
-        r3.addStretch(1)
-        gr.addLayout(r3)
-        glaunch = QHBoxLayout()
-        self.btn_launch = QPushButton("Запустити гру")
-        glaunch.addWidget(self.btn_launch)
-        glaunch.addStretch()
-        gr.addLayout(glaunch)
-        gnote = QLabel(
-            "Vulkan-гри фіксуються на карті через VK_LOADER_VENDOR_ID_FILTER (Intel/AMD/NVIDIA); "
-            "OpenGL/EGL обмежень по вендору не мають. Монітори повернуться після гри.")
-        gnote.setWordWrap(True)
-        gnote.setObjectName("desc")
-        gr.addWidget(gnote)
-        top_row.addWidget(gbox, 1)
-        root.addLayout(top_row)
+        root.addWidget(box)
 
         # ---- контейнер карток (біля-біля)
         self.container = QHBoxLayout()
         root.addLayout(self.container)
 
         # ---- процеси у VRAM
-        pbox = QGroupBox("Процеси, що тримають VRAM (NVIDIA — усі; AMD без root — лише ваші)")
+        pbox = QGroupBox(
+            "Процеси GPU: VRAM та завантаження % (NVIDIA — усі; AMD без root — лише ваші)")
         proot = QVBoxLayout(pbox)
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Карта", "Процес", "PID", "VRAM, МБ"])
+        self.tree.setHeaderLabels(["Карта", "Процес", "PID", "VRAM, МБ", "GPU, %"])
+        self.tree.headerItem().setToolTip(
+            4, "AMD/Intel: за часом GPU-движків у fdinfo; NVIDIA: SM utilization з nvidia-smi pmon. "
+               "Якщо NVIDIA не завантажена, для її процесів показується 0%. «—» під час "
+               "навантаження означає, що драйвер не надав окремого показника процесу.")
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
         self.tree.setMinimumHeight(100)
+        self.tree.header().setStretchLastSection(False)
         self.tree.setColumnWidth(0, 150)
         self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.tree.setColumnWidth(2, 70)
         self.tree.setColumnWidth(3, 90)
+        self.tree.setColumnWidth(4, 75)
         proot.addWidget(self.tree)
         brow = QHBoxLayout()
         self.btn_root = QPushButton("Повний список (root — діалог KDE)")
@@ -686,16 +709,17 @@ class App(QWidget):
         self.btn_reset.clicked.connect(self.reset_all)
         self.btn_kill.clicked.connect(self.kill_selected)
         self.btn_root.clicked.connect(self.do_root_scan)
-        self.btn_launch.clicked.connect(self.launch_game)
         self.combo.currentIndexChanged.connect(self.on_combo)
-        self.combo_game.currentIndexChanged.connect(self.on_combo_game)
 
-        self.game_pci = None
-        self.game_proc = None
-        self.restore_after_game = False
         self.root_procs = None
         self.root_ts = 0.0
         self.checks_synced = False
+        self.process_util = {}
+        self.nvidia_proc_util = {}
+        self._nvidia_pmon_warned = False
+        self.nvidia_pmon = QProcess(self)
+        self.nvidia_pmon.finished.connect(self.on_nvidia_pmon_finished)
+        self.nvidia_pmon.errorOccurred.connect(self.on_nvidia_pmon_error)
 
         self._theme = self._build_theme()
         self.setStyleSheet(self._qss())
@@ -741,7 +765,6 @@ class App(QWidget):
             "warn": "#ffab40" if dark else "#e6890b",
             "err": "#ff6e6e" if dark else "#c62828",
             "free": "#4fc3f7" if dark else "#1565c0",
-            "game": "#ffb74d" if dark else "#ef6c00",
         }
 
     def _qss(self):
@@ -763,7 +786,6 @@ class App(QWidget):
             color: {t['text']};
         }}
         QGroupBox[role="free"]::title {{ color: {t['free']}; font-weight: bold; }}
-        QGroupBox[role="game"]::title {{ color: {t['game']}; font-weight: bold; }}
         QGroupBox[selected="true"] {{ border: 2px solid {t['highlight']}; }}
         QGroupBox[selected="true"]::title {{ color: {t['highlight']}; }}
         QLabel#desc {{ color: {t['muted']}; font-size: 12px; }}
@@ -789,26 +811,7 @@ class App(QWidget):
 
     # ---- оновлення
     def tick(self):
-        self.watch_game()
         self.apply(scan())
-
-    def watch_game(self):
-        """Якщо запущена з програмою гра завершилася — повернути монітори."""
-        if self.game_proc is None:
-            return
-        rc = self.game_proc.poll()
-        if rc is None:
-            return
-        self.game_proc = None
-        restore, self.restore_after_game = self.restore_after_game, False
-        if restore:
-            for g in self.data:
-                self.change([n for n, e in g["conns"] if not e], True)
-            self.status.setText(f"Гру завершено (код {rc}), монітори повернено")
-            self.data = scan()
-            self.apply(self.data)
-        else:
-            self.status.setText(f"Гру завершено (код {rc})")
 
     def apply(self, data):
         self.data = data
@@ -971,26 +974,17 @@ class App(QWidget):
                 self.ai_pci = saved
             elif self.data:
                 self.ai_pci = max(self.data, key=lambda g: g["total"] or 0)["pci"]
-        for combo, attr in ((self.combo, "ai_pci"), (self.combo_game, "game_pci")):
-            combo.blockSignals(True)
-            combo.clear()
-            for _, t in self.combo_map:
-                combo.addItem(t)
-            val = getattr(self, attr)
-            if val not in pcis:
-                setattr(self, attr, self.ai_pci)
-                val = self.ai_pci
-            if val in pcis:
-                combo.setCurrentIndex(pcis.index(val))
-            combo.blockSignals(False)
+        self.combo.blockSignals(True)
+        self.combo.clear()
+        for _, text in self.combo_map:
+            self.combo.addItem(text)
+        if self.ai_pci in pcis:
+            self.combo.setCurrentIndex(pcis.index(self.ai_pci))
+        self.combo.blockSignals(False)
 
     def on_combo(self, idx):
         if 0 <= idx < len(getattr(self, "combo_map", [])):
             self.ai_pci = self.combo_map[idx][0]
-
-    def on_combo_game(self, idx):
-        if 0 <= idx < len(getattr(self, "combo_map", [])):
-            self.game_pci = self.combo_map[idx][0]
 
     def sync_checks(self, ai):
         """Синхронізує чекбокси з фактичним станом (на старті та після дій)."""
@@ -1054,8 +1048,18 @@ class App(QWidget):
     def refresh_procs(self):
         if self.root_procs is not None and time.monotonic() - self.root_ts < self.ROOT_TTL:
             procs = self.root_procs
+            _, engine_times = vram_processes(with_engine_times=True)
         else:
-            procs = vram_processes()
+            procs, engine_times = vram_processes(with_engine_times=True)
+        self.process_util = process_engine_utilization(engine_times)
+        self.process_util.update(self.nvidia_proc_util)
+        idle_nvidia_pcis = {
+            g["pci"] for g in self.data
+            if g["vendor"] == "NVIDIA" and g.get("util") == 0
+        }
+        for pci in idle_nvidia_pcis:
+            for pid, _name, _mb in procs.get(pci, []):
+                self.process_util[(pci, pid)] = 0.0
         names = {g["pci"]: g["short"] for g in self.data}
         sel = self.tree.currentItem()
         sel_key = sel.text(2) if sel else None  # PID — третя колонка
@@ -1064,9 +1068,13 @@ class App(QWidget):
             for pid, name, mb in lst:
                 if mb < 1:  # шум: fd відкритий, але VRAM фактично нульовий
                     continue
-                item = QTreeWidgetItem([names.get(pci, pci), name, str(pid), f"{mb:.0f}"])
-                item.setTextAlignment(2, Qt.AlignmentFlag.AlignRight)
-                item.setTextAlignment(3, Qt.AlignmentFlag.AlignRight)
+                utilization = self.process_util.get((pci, pid))
+                text = f"{utilization:.0f}" if utilization is not None else "—"
+                item = QTreeWidgetItem(
+                    [names.get(pci, pci), name, str(pid), f"{mb:.0f}", text])
+                item.setData(0, Qt.ItemDataRole.UserRole, pci)
+                for column in (2, 3, 4):
+                    item.setTextAlignment(column, Qt.AlignmentFlag.AlignRight)
                 self.tree.addTopLevelItem(item)
                 if sel_key and item.text(2) == sel_key:
                     self.tree.setCurrentItem(item)
@@ -1083,10 +1091,60 @@ class App(QWidget):
                     note = "інші (не видно без root)"
                 else:
                     note = "не атрибутовано (ядро/драйвер)"
-                item = QTreeWidgetItem([names.get(pci, pci), note, "—", f"{diff:.0f}"])
-                item.setTextAlignment(2, Qt.AlignmentFlag.AlignRight)
-                item.setTextAlignment(3, Qt.AlignmentFlag.AlignRight)
+                item = QTreeWidgetItem(
+                    [names.get(pci, pci), note, "—", f"{diff:.0f}", "—"])
+                for column in (2, 3, 4):
+                    item.setTextAlignment(column, Qt.AlignmentFlag.AlignRight)
                 self.tree.addTopLevelItem(item)
+        self.start_nvidia_pmon()
+
+    def start_nvidia_pmon(self):
+        if (not any(g["vendor"] == "NVIDIA" for g in self.data)
+                or not shutil.which("nvidia-smi")
+                or self.nvidia_pmon.state() != QProcess.ProcessState.NotRunning):
+            return
+        self.nvidia_pmon.start("nvidia-smi", ["pmon", "-c", "1", "-s", "u"])
+
+    def on_nvidia_pmon_finished(self, exit_code, _exit_status):
+        if exit_code == 0:
+            output = bytes(self.nvidia_pmon.readAllStandardOutput()).decode(
+                "utf-8", errors="replace")
+            self.nvidia_proc_util = nvidia_process_utilization(output, nvidia_pci_map())
+        else:
+            error = bytes(self.nvidia_pmon.readAllStandardError()).decode(
+                "utf-8", errors="replace").strip()
+            self.nvidia_proc_util = {}
+            if not self._nvidia_pmon_warned:
+                message = error.splitlines()[-1] if error else f"код завершення {exit_code}"
+                self.set_status(f"Не вдалося прочитати завантаження процесів NVIDIA: {message}",
+                                "warn")
+                self._nvidia_pmon_warned = True
+        nvidia_pcis = {g["pci"] for g in self.data if g["vendor"] == "NVIDIA"}
+        self.process_util = {key: value for key, value in self.process_util.items()
+                             if key[0] not in nvidia_pcis}
+        self.process_util.update(self.nvidia_proc_util)
+        self.update_process_utilization_cells()
+
+    def on_nvidia_pmon_error(self, _error):
+        if not self._nvidia_pmon_warned:
+            self.set_status(
+                f"Не вдалося запустити nvidia-smi pmon: {self.nvidia_pmon.errorString()}",
+                "warn")
+            self._nvidia_pmon_warned = True
+
+    def update_process_utilization_cells(self):
+        idle_nvidia_pcis = {
+            g["pci"] for g in self.data
+            if g["vendor"] == "NVIDIA" and g.get("util") == 0
+        }
+        for index in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(index)
+            pci = item.data(0, Qt.ItemDataRole.UserRole)
+            pid = to_int(item.text(2))
+            utilization = self.process_util.get((pci, pid)) if pci and pid else None
+            if pci in idle_nvidia_pcis and pid is not None:
+                utilization = 0.0
+            item.setText(4, f"{utilization:.0f}" if utilization is not None else "—")
 
     # ---- вентилятор (AMD) і ліміт потужності (NVIDIA)
     def _pkexec(self, cmd):
@@ -1113,7 +1171,7 @@ class App(QWidget):
             return
         val = w["fan_slider"].value()
         sh = shutil.which("sh") or "/bin/sh"
-        r = self._pkexec([sh, "-c", f"echo {val} > {path}"])
+        r = self._pkexec(["pkexec", sh, "-c", f"echo {val} > {path}"])
         if r is None:
             return
         if r.returncode == 0:
@@ -1133,7 +1191,7 @@ class App(QWidget):
             self.set_status("Не знайдено nvidia-smi/індекс GPU", "warn")
             return
         val = w["pwr_slider"].value()
-        r = self._pkexec([smi, f"--id={idx}", f"--power-limit={val}"])
+        r = self._pkexec(["pkexec", smi, f"--id={idx}", f"--power-limit={val}"])
         if r is None:
             return
         if r.returncode == 0:
@@ -1309,7 +1367,8 @@ class App(QWidget):
             if QMessageBox.question(
                     self, "Перелогін",
                     "Щоб робочий стіл перемалювався на іншу карту, потрібен вихід з сесії. "
-                    "Спершу збережіть роботу у відкритих програмах. Вийти зараз?"):
+                    "Спершу збережіть роботу у відкритих програмах. Вийти зараз?") \
+                    == QMessageBox.StandardButton.Yes:
                 logout()
 
     def reset_all(self):
@@ -1329,40 +1388,9 @@ class App(QWidget):
         self.sync_checks(ai)
         if QMessageBox.question(
                 self, "Перелогін",
-                "Щоб робочий стіл повернувся на головну карту, потрібен вихід з сесії. Вийти зараз?"):
+                "Щоб робочий стіл повернувся на головну карту, потрібен вихід з сесії. Вийти зараз?") \
+                == QMessageBox.StandardButton.Yes:
             logout()
-
-    # ---- запуск гри на обраній карті
-    def launch_game(self):
-        cmd_text = self.edit_cmd.text().strip()
-        if not cmd_text:
-            return
-        g = next((g for g in self.data if g["pci"] == self.game_pci), None)
-        if not g:
-            return
-        if self.chk_other_off.isChecked():
-            mine_off = [n for n, e in g["conns"] if not e]
-            others_on = [n for gg in self.data if gg is not g for n, e in gg["conns"] if e]
-            if not any(e for _, e in g["conns"]) and not mine_off:
-                QMessageBox.critical(self, "Не можна",
-                                     "До цієї карти не підключено жодного монітора.")
-                return
-            self.change(mine_off, True)
-            if not self.change(others_on, False):
-                return
-        env = dict(os.environ)
-        vid = VK_VENDOR_IDS.get(g["vendor"])
-        if vid:  # Vulkan-лоадер (>= 1.4.326): фіксує GPU за вендором; OpenGL/EGL не підпорядковується
-            env["VK_LOADER_VENDOR_ID_FILTER"] = vid
-        if g["vendor"] == "NVIDIA":
-            env["__NV_PRIME_PROFILE"] = "pci:" + ":".join(g["pci"].split(":")[1:])
-        try:
-            self.game_proc = subprocess.Popen(shlex.split(cmd_text), env=env, start_new_session=True)
-        except OSError as e:
-            self.status.setText(f"Не вдалося запустити гру: {e}")
-            return
-        self.restore_after_game = self.chk_other_off.isChecked()
-        self.status.setText(f"Гру запущено на {g['name']} (PID {self.game_proc.pid})")
 
     def kill_selected(self):
         item = self.tree.currentItem()
