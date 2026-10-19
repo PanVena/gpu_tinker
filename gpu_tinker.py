@@ -2,6 +2,9 @@
 """GPU Switch (PySide6): стан відеокарт, монітори, процеси у VRAM і звільнення
 обраної карти від робочого столу (KDE Plasma, Wayland).
 
+Панелі карток показують активні режими моніторів;
+AMD — керування вентилятором, NVIDIA — ліміт потужності (root — вбуданий діалог KDE).
+
 Панель «Звільнити карту» має два незалежні чекбокси:
   1. Вимкнути монітори обраної карти — діє одразу, без виходу з сесії.
   2. Робочий стіл малювати на іншій карті — пише
@@ -31,12 +34,14 @@ import signal
 import subprocess
 import sys
 
+from collections import deque
+
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QGroupBox,
                                 QHeaderView,
                                QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-                               QProgressBar, QPushButton, QTreeWidget,
+                               QProgressBar, QPushButton, QSlider, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 DRM = "/sys/class/drm"
@@ -96,6 +101,15 @@ def norm_pci(s):
         return None
 
 
+def drm_card_pci(n):
+    """/dev/dri/cardN -> PCI-адреса (останній сегмент realpath /sys/class/drm/cardN/device)."""
+    try:
+        real = os.path.realpath(f"/sys/class/drm/card{n}/device")
+    except OSError:
+        return None
+    return norm_pci(real.rsplit("/", 1)[-1])
+
+
 def gpu_name(pci):
     parts = re.findall(r'"([^"]*)"', run(["lspci", "-s", pci, "-mm"]))
     return parts[2] if len(parts) >= 3 else pci
@@ -110,17 +124,50 @@ def short_name(full):
 
 
 def nvidia_stats():
-    """{'0000:04:00.0': {name,used,total,util,temp,power}}"""
+    """{'0000:04:00.0': {name,used,total,util,temp,power,pwr_limit,pwr_min,pwr_max}}"""
     res = {}
-    q = "pci.bus_id,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw"
+    q = ("pci.bus_id,name,memory.used,memory.total,utilization.gpu,temperature.gpu,"
+         "power.draw,power.limit,power.min_limit,power.max_limit")
     for line in run(["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits"]).splitlines():
         p = [x.strip() for x in line.split(",")]
-        if len(p) == 7:
+        if len(p) == 10:
             pci = norm_pci(p[0])
             if pci:
                 res[pci] = {
                     "name": p[1], "used": to_int(p[2]), "total": to_int(p[3]),
-                    "util": to_float(p[4]), "temp": to_float(p[5]), "power": to_float(p[6])}
+                    "util": to_float(p[4]), "temp": to_float(p[5]), "power": to_float(p[6]),
+                    "pwr_limit": to_float(p[7]), "pwr_min": to_float(p[8]),
+                    "pwr_max": to_float(p[9])}
+    return res
+
+
+def nvidia_index(pci):
+    """Індекс GPU для nvidia-smi --id за PCI-адресою."""
+    for line in run(["nvidia-smi", "--query-gpu=index,pci.bus_id",
+                     "--format=csv,noheader"]).splitlines():
+        p = [x.strip() for x in line.split(",")]
+        if len(p) == 2 and norm_pci(p[1]) == pci:
+            return p[0]
+    return None
+
+
+def kscreen_modes():
+    """{назва виходу: активний режим, напр. '2560×1440@60'} через kscreen-doctor -o."""
+    out = run(["kscreen-doctor", "-o"], timeout=10)
+    if not out:
+        return {}
+    txt = re.sub(r"\x1b\[[0-9;]*m", "", out)
+    res, name = {}, None
+    for line in txt.splitlines():
+        s = line.strip()
+        m = re.match(r"Output:\s*\d+\s+(\S+)", s)
+        if m:
+            name = m.group(1)
+            continue
+        if name and s.startswith("Modes:"):
+            mm = re.search(r"(\d+)x(\d+)@([\d.]+)!", s)
+            if mm:
+                res[name] = f"{mm.group(1)}×{mm.group(2)}@{int(round(float(mm.group(3))))}"
     return res
 
 
@@ -189,7 +236,7 @@ def hwmon_value(dev, names, scale):
 
 
 def scan():
-    gpus, nv = [], None
+    gpus, nv, modes = [], None, kscreen_modes()
     for card_path in sorted(glob.glob(f"{DRM}/card[0-9]*")):
         card = os.path.basename(card_path)
         if "-" in card:
@@ -216,6 +263,9 @@ def scan():
             g["util"] = to_float(read(f"{dev}/gpu_busy_percent"))
             g["temp"] = hwmon_value(dev, ["temp1_input"], 1000)
             g["power"] = hwmon_value(dev, ["power1_average", "power1_input"], 1e6)
+            g["fan"] = hwmon_value(dev, ["fan1_input"], 1)
+            g["fan_max"] = hwmon_value(dev, ["fan1_max"], 1)
+            g["fan_target"] = hwmon_value(dev, ["fan1_target"], 1)
         elif vendor == "NVIDIA" and shutil.which("nvidia-smi"):
             if nv is None:
                 nv = nvidia_stats()
@@ -229,6 +279,7 @@ def scan():
             if read(f"{c}/status") == "connected":
                 conns.append((os.path.basename(c)[len(card) + 1:], read(f"{c}/enabled") == "enabled"))
         g["conns"] = conns
+        g["modes"] = modes
         gpus.append(g)
     return gpus
 
@@ -291,18 +342,32 @@ def set_output(name, enable):
 
 # ------------------------------------------------------------ керування KWin
 def kwin_env():
-    """Значення KWIN_DRM_DEVICES у запущеному kwin_wayland ('' якщо не задано, None якщо kwin не знайдено)."""
-    pids = run(["pidof", "kwin_wayland"]).split()
-    if not pids:
-        return None
-    try:
-        with open(f"/proc/{pids[0]}/environ", "rb") as f:
-            for item in f.read().split(b"\0"):
-                if item.startswith(b"KWIN_DRM_DEVICES="):
-                    return item.split(b"=", 1)[1].decode()
-    except OSError:
-        return None
-    return ""
+    """Значення KWIN_DRM_DEVICES у сесії ('' якщо не задано, None якщо не знайдено)."""
+    for pid in run(["pidof", "kwin_wayland"]).split():
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                for item in f.read().split(b"\0"):
+                    if item.startswith(b"KWIN_DRM_DEVICES="):
+                        return item.split(b"=", 1)[1].decode()
+        except OSError:
+            continue
+    v = os.environ.get("KWIN_DRM_DEVICES")
+    if v:
+        return v
+    me = os.getuid()
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{name}").st_uid != me:
+                continue
+            with open(f"/proc/{name}/environ", "rb") as f:
+                for item in f.read().split(b"\0"):
+                    if item.startswith(b"KWIN_DRM_DEVICES="):
+                        return item.split(b"=", 1)[1].decode()
+        except OSError:
+            continue
+    return None
 
 
 def kwin_draw_pci():
@@ -311,7 +376,8 @@ def kwin_draw_pci():
     if not env:
         return None
     for part in env.split(":"):
-        pci = norm_pci(part)
+        m = re.fullmatch(r"/dev/dri/card(\d+)", part.strip())
+        pci = drm_card_pci(m.group(1)) if m else norm_pci(part)
         if pci:
             return pci
     return None
@@ -349,13 +415,15 @@ class App(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("GPU Switch")
-        self.resize(1180, 860)
-        self.setMinimumSize(980, 780)
+        self.resize(1280, 700)
+        self.setMinimumSize(1000, 690)
         self.data, self.widgets = [], {}
         self.sig = None
         self.ai_pci = None
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
         top_row = QHBoxLayout()
 
         # ---- панель «звільнити карту»
@@ -368,13 +436,21 @@ class App(QWidget):
         broot.addLayout(row)
 
         self.chk_monitors = QCheckBox("Вимкнути монітори цієї карти")
-        self.lbl_monitors = QLabel("Діє одразу, вихід із сесії не потрібен.")
+        self.lbl_monitors = QLabel("Діє одразу, без виходу з сесії.")
         self.lbl_monitors.setObjectName("desc")
-        self.chk_desktop = QCheckBox("Робочий стіл малювати на іншій карті (KWin переключить GPU)")
-        self.lbl_desktop = QLabel("Почне діяти після виходу з сесії та повторного входу.")
+        r1 = QHBoxLayout()
+        r1.addWidget(self.chk_monitors)
+        r1.addWidget(self.lbl_monitors)
+        r1.addStretch(1)
+        broot.addLayout(r1)
+        self.chk_desktop = QCheckBox("Робочий стіл малювати на іншій карті (KWin)")
+        self.lbl_desktop = QLabel("Почне діяти після повторного входу.")
         self.lbl_desktop.setObjectName("desc")
-        for w in (self.chk_monitors, self.lbl_monitors, self.chk_desktop, self.lbl_desktop):
-            broot.addWidget(w)
+        r2 = QHBoxLayout()
+        r2.addWidget(self.chk_desktop)
+        r2.addWidget(self.lbl_desktop)
+        r2.addStretch(1)
+        broot.addLayout(r2)
         btns = QHBoxLayout()
         self.btn_apply = QPushButton("Застосувати зміни")
         self.btn_reset = QPushButton("Скасувати: увімкнути всі монітори і видалити налаштування")
@@ -400,18 +476,21 @@ class App(QWidget):
         self.combo_game = QComboBox()
         grow2.addWidget(self.combo_game, 1)
         gr.addLayout(grow2)
-        self.chk_other_off = QCheckBox(
-            "Вимкнути монітори інших карт (гра буде видно лише на екранах цієї карти)")
-        gr.addWidget(self.chk_other_off)
+        self.chk_other_off = QCheckBox("Вимкнути монітори інших карт")
+        lbl_other = QLabel("(гра буде видно лише на екранах цієї карти)")
+        lbl_other.setObjectName("desc")
+        r3 = QHBoxLayout()
+        r3.addWidget(self.chk_other_off)
+        r3.addWidget(lbl_other)
+        r3.addStretch(1)
+        gr.addLayout(r3)
         glaunch = QHBoxLayout()
         self.btn_launch = QPushButton("Запустити гру")
         glaunch.addWidget(self.btn_launch)
         glaunch.addStretch()
         gr.addLayout(glaunch)
         gnote = QLabel(
-            "Vulkan-ігри: GPU встановлюється через VK_ICD_VENDOR; OpenGL на NVIDIA — через "
-            "__NV_PRIME_PROFILE (X11). Якщо чекбокс увімкнено, монітори інших карт вимкнуться, "
-            "а після завершення гри повернуться автоматично.")
+            "GPU задається через VK_ICD_VENDOR / __NV_PRIME_PROFILE; монітори повернуться після гри.")
         gnote.setWordWrap(True)
         gnote.setObjectName("desc")
         gr.addWidget(gnote)
@@ -423,14 +502,13 @@ class App(QWidget):
         root.addLayout(self.container)
 
         # ---- процеси у VRAM
-        pbox = QGroupBox("Процеси, що тримають VRAM (NVIDIA — усі, включно з OpenGL/EGL; "
-                         "AMD — лише ваші без root)")
+        pbox = QGroupBox("Процеси, що тримають VRAM (NVIDIA — усі; AMD без root — лише ваші)")
         proot = QVBoxLayout(pbox)
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Карта", "Процес", "PID", "VRAM, МБ"])
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
-        self.tree.setMinimumHeight(230)
+        self.tree.setMinimumHeight(100)
         self.tree.setColumnWidth(0, 150)
         self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.tree.setColumnWidth(2, 70)
@@ -463,6 +541,7 @@ class App(QWidget):
         self.restore_after_game = False
         self.root_procs = None
         self.root_ts = 0.0
+        self.checks_synced = False
 
         self._theme = self._build_theme()
         self.setStyleSheet(self._qss())
@@ -512,15 +591,15 @@ class App(QWidget):
         return f"""
         QGroupBox {{
             border: 1px solid {t['border']};
-            border-radius: 8px;
-            margin-top: 12px;
-            padding: 12px 10px 10px 10px;
+            border-radius: 6px;
+            margin-top: 10px;
+            padding: 8px 8px 6px 8px;
         }}
         QGroupBox::title {{
             subcontrol-origin: padding;
             subcontrol-position: top left;
-            left: 14px;
-            padding: 2px 8px;
+            left: 12px;
+            padding: 1px 6px;
             background: {t['panel_bg']};
             border-radius: 5px;
             color: {t['text']};
@@ -568,6 +647,8 @@ class App(QWidget):
             for g in self.data:
                 self.change([n for n, e in g["conns"] if not e], True)
             self.status.setText(f"Гру завершено (код {rc}), монітори повернено")
+            self.data = scan()
+            self.apply(self.data)
         else:
             self.status.setText(f"Гру завершено (код {rc})")
 
@@ -591,7 +672,7 @@ class App(QWidget):
                 w["bar"].setValue(0)
             parts = []
             if g["util"] is not None:
-                parts.append(f"навантаження {g['util']:.0f}%")
+                parts.append(f"Навантаження: {g['util']:.0f}%")
             if g["temp"] is not None:
                 parts.append(f"{g['temp']:.0f} °C")
             if g["power"] is not None:
@@ -599,13 +680,27 @@ class App(QWidget):
             if g["rt"]:
                 parts.append(f"стан: {g['rt']}")
             w["metrics"].setText(" · ".join(parts) or "метрики недоступні")
+            w["util_bar"].setValue(
+                int(max(0.0, min(100.0, g["util"]))) if g["util"] is not None else 0)
+            if w.get("fan_lbl") is not None and g.get("fan") is not None:
+                tgt = g.get("fan_target")
+                extra = f" (ціль {tgt:.0f} об/хв)" if tgt else " (авто)"
+                w["fan_lbl"].setText(f"Вентилятор: {g['fan']:.0f} об/хв{extra}")
+            if w.get("pwr_slider") is not None and g.get("pwr_limit") is not None:
+                w["pwr_lbl"].setText(
+                    f"Потужність: ≤ {g['pwr_limit']:.0f} Вт "
+                    f"(діапазон {g['pwr_min']:.0f}–{g['pwr_max']:.0f})")
             for cname, enabled in g["conns"]:
                 cw = w["conns"][cname]
+                mode = (g.get("modes") or {}).get(cname)
+                cw["lbl"].setText(f"{cname} · {mode}" if mode else cname)
                 cw["state"].setText("увімкнено" if enabled else "вимкнено")
                 cw["state"].setStyleSheet(
                     f"color: {'#2e7d32' if enabled else '#b71c1c'};")
                 cw["btn"].setText("Вимкнути" if enabled else "Увімкнути")
-        self.sync_checks(ai)
+        if not self.checks_synced:  # синхронізація лише на старті, щоб не скидати вибір користувача
+            self.sync_checks(ai)
+            self.checks_synced = True
         self.update_mode_label()
 
     def rebuild(self):
@@ -628,12 +723,45 @@ class App(QWidget):
             v.addWidget(w["bar"])
             w["metrics"] = QLabel()
             v.addWidget(w["metrics"])
+            w["util_bar"] = QProgressBar()
+            w["util_bar"].setMaximum(100)
+            v.addWidget(w["util_bar"])
+            if g.get("fan") is not None and g.get("fan_max"):
+                fr = QHBoxLayout()
+                w["fan_lbl"] = QLabel()
+                fr.addWidget(w["fan_lbl"])
+                fr.addStretch(1)
+                sld = QSlider(Qt.Orientation.Horizontal)
+                sld.setRange(0, int(g["fan_max"]))
+                sld.setValue(int(g.get("fan_target") or g["fan"]))
+                sld.setFixedWidth(130)
+                fr.addWidget(sld)
+                fb = QPushButton("Застосувати (root — діалог KDE)")
+                fb.clicked.connect(lambda _=False, c=card: self.apply_fan(c))
+                fr.addWidget(fb)
+                v.addLayout(fr)
+                w["fan_slider"] = sld
+            if g.get("pwr_limit") is not None and g.get("pwr_max"):
+                pr = QHBoxLayout()
+                w["pwr_lbl"] = QLabel()
+                pr.addWidget(w["pwr_lbl"])
+                pr.addStretch(1)
+                sld = QSlider(Qt.Orientation.Horizontal)
+                sld.setRange(int(g["pwr_min"]), int(g["pwr_max"]))
+                sld.setValue(int(g["pwr_limit"]))
+                sld.setFixedWidth(130)
+                pr.addWidget(sld)
+                pb = QPushButton("Застосувати (root — діалог KDE)")
+                pb.clicked.connect(lambda _=False, c=card: self.apply_power(c))
+                pr.addWidget(pb)
+                v.addLayout(pr)
+                w["pwr_slider"] = sld
             if not g["conns"]:
                 v.addWidget(QLabel("Підключених моніторів немає"))
             for cname, _ in g["conns"]:
                 row = QHBoxLayout()
-                lbl = QLabel(cname)
-                lbl.setMinimumWidth(130)
+                lbl = QLabel()
+                lbl.setMinimumWidth(185)
                 state = QLabel()
                 state.setMinimumWidth(110)
                 btn = QPushButton()
@@ -643,7 +771,7 @@ class App(QWidget):
                 row.addStretch()
                 row.addWidget(btn)
                 v.addLayout(row)
-                w["conns"][cname] = {"state": state, "btn": btn}
+                w["conns"][cname] = {"lbl": lbl, "state": state, "btn": btn}
             if g["conns"]:
                 bar = QHBoxLayout()
                 b1 = QPushButton("Вимкнути всі виходи карти")
@@ -692,7 +820,7 @@ class App(QWidget):
             self.game_pci = self.combo_map[idx][0]
 
     def sync_checks(self, ai):
-        """Чекбокси відображають фактичний стан системи."""
+        """Синхронізує чекбокси з фактичним станом (на старті та після дій)."""
         if ai and ai["conns"]:
             self.chk_monitors.setChecked(not any(e for _, e in ai["conns"]))
         else:
@@ -787,6 +915,61 @@ class App(QWidget):
                 item.setTextAlignment(3, Qt.AlignmentFlag.AlignRight)
                 self.tree.addTopLevelItem(item)
 
+    # ---- вентилятор (AMD) і ліміт потужності (NVIDIA)
+    def _pkexec(self, cmd):
+        """Запустити команду через pkexec (вбуданий діалог KDE). None — не вдалося."""
+        if not shutil.which("pkexec"):
+            self.set_status("pkexec не знайдено", "warn")
+            return None
+        self.set_status("Очікуємо підтвердження у діалозі KDE…")
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError):
+            self.set_status("Не вдалося запустити команду", "warn")
+            return None
+        return r
+
+    def apply_fan(self, card):
+        g = next((x for x in self.data if x["card"] == card), None)
+        w = self.widgets.get(card, {})
+        if not g or "fan_slider" not in w:
+            return
+        path = next(iter(glob.glob(f"{DRM}/{card}/device/hwmon/hwmon*/fan1_target")), None)
+        if not path:
+            self.set_status("Не знайдено fan1_target", "warn")
+            return
+        val = w["fan_slider"].value()
+        sh = shutil.which("sh") or "/bin/sh"
+        r = self._pkexec([sh, "-c", f"echo {val} > {path}"])
+        if r is None:
+            return
+        if r.returncode == 0:
+            self.set_status(f"Ціль вентилятора: {val} об/хв", "ok")
+            QTimer.singleShot(1200, self.tick)
+        else:
+            self.set_status("Не вдалося встановити швидкість вентилятора", "warn")
+
+    def apply_power(self, card):
+        g = next((x for x in self.data if x["card"] == card), None)
+        w = self.widgets.get(card, {})
+        if not g or "pwr_slider" not in w:
+            return
+        smi = shutil.which("nvidia-smi")
+        idx = nvidia_index(g["pci"])
+        if not smi or idx is None:
+            self.set_status("Не знайдено nvidia-smi/індекс GPU", "warn")
+            return
+        val = w["pwr_slider"].value()
+        r = self._pkexec([smi, f"--id={idx}", f"--power-limit={val}"])
+        if r is None:
+            return
+        if r.returncode == 0:
+            self.set_status(f"Ліміт потужності: {val} Вт", "ok")
+            QTimer.singleShot(1200, self.tick)
+        else:
+            err = (r.stderr or r.stdout).strip().splitlines()
+            self.set_status(f"Не вдалося встановити ліміт ({err[0][:80] if err else 'помилка'})", "warn")
+
     # ---- дії над моніторами
     def enabled_outputs(self):
         return [n for g in self.data for n, e in g["conns"] if e]
@@ -854,6 +1037,8 @@ class App(QWidget):
 
         self.data = scan()
         self.apply(self.data)
+        ai = next((g for g in self.data if g["pci"] == self.ai_pci), None)
+        self.sync_checks(ai)
         if env_changed:
             self.status.setText("Налаштування записано.")
             if QMessageBox.question(
@@ -875,6 +1060,8 @@ class App(QWidget):
             self.change([n for n, e in g["conns"] if not e], True)
         self.data = scan()
         self.apply(self.data)
+        ai = next((g for g in self.data if g["pci"] == self.ai_pci), None)
+        self.sync_checks(ai)
         if QMessageBox.question(
                 self, "Перелогін",
                 "Щоб робочий стіл повернувся на головну карту, потрібен вихід з сесії. Вийти зараз?"):
