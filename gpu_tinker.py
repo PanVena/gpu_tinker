@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
 
 DRM = "/sys/class/drm"
 ENV_FILE = os.path.expanduser("~/.config/plasma-workspace/env/gpu-ai-mode.sh")
+ENV_MARKER = "# Створено gpu_tinker.py. Видаліть цей файл, щоб повернути стандартну поведінку."
 VENDORS = {"0x1002": "AMD", "0x10de": "NVIDIA", "0x8086": "Intel"}
 REFRESH_MS = 2000
 PROCS_MS = 4000
@@ -171,15 +172,19 @@ def kscreen_modes():
     if not out:
         return {}
     txt = re.sub(r"\x1b\[[0-9;]*m", "", out)
-    res, name = {}, None
+    res, name, enabled = {}, None, False
     for line in txt.splitlines():
         s = line.strip()
         m = re.match(r"Output:\s*\d+\s+(\S+)", s)
         if m:
             name = m.group(1)
+            enabled = False
             continue
-        if name and s.startswith("Modes:"):
-            mm = re.search(r"(\d+)x(\d+)@([\d.]+)!", s)
+        if name and s == "enabled":
+            enabled = True
+            continue
+        if name and enabled and s.startswith("Modes:"):
+            mm = re.search(r"(\d+)x(\d+)@([\d.]+)\*", s)
             if mm:
                 res[name] = f"{mm.group(1)}×{mm.group(2)}@{int(round(float(mm.group(3))))}"
     return res
@@ -301,8 +306,25 @@ def hwmon_value(dev, names, scale):
     return None
 
 
+def edid_monitor_name(connector):
+    try:
+        with open(f"{connector}/edid", "rb") as f:
+            edid = f.read(128)
+    except OSError:
+        return None
+    if len(edid) < 128 or edid[:8] != b"\x00\xff\xff\xff\xff\xff\xff\x00":
+        return None
+    for offset in range(54, 126, 18):
+        descriptor = edid[offset:offset + 18]
+        if descriptor[:5] == b"\x00\x00\x00\xfc\x00":
+            name = descriptor[5:].decode("ascii", errors="ignore").replace("\n", "").strip()
+            return name or None
+    return None
+
+
 def scan():
     gpus, nv, modes = [], None, kscreen_modes()
+    amd_names = None
     for card_path in sorted(glob.glob(f"{DRM}/card[0-9]*")):
         card = os.path.basename(card_path)
         if "-" in card:
@@ -315,7 +337,9 @@ def scan():
                   if os.path.exists(f"{dev}/driver") else "—")
         name = gpu_name(pci)
         if vendor == "AMD":  # lspci дає неоднозначну назву (XT/XTX/GRE), беремо точну
-            name = amdgpu_names().get(pci, name)
+            if amd_names is None:
+                amd_names = amdgpu_names()
+            name = amd_names.get(pci, name)
         g = {"card": card, "pci": pci, "vendor": vendor, "driver": driver,
              "name": name, "short": short_name(name),
              "used": None, "total": None, "util": None,
@@ -332,6 +356,13 @@ def scan():
             g["fan"] = hwmon_value(dev, ["fan1_input"], 1)
             g["fan_max"] = hwmon_value(dev, ["fan1_max"], 1)
             g["fan_target"] = hwmon_value(dev, ["fan1_target"], 1)
+            g["fan_pwm"] = hwmon_value(dev, ["pwm1"], 1)
+            g["fan_pwm_max"] = hwmon_value(dev, ["pwm1_max"], 1)
+            g["fan_pwm_mode"] = hwmon_value(dev, ["pwm1_enable"], 1)
+            g["fan_pwm_control"] = (g["fan_pwm_mode"] is not None
+                                    and g["fan_pwm_max"] is not None
+                                    and g["fan_pwm_max"] > 0)
+            g["fan_manual"] = g["fan_pwm_mode"] == 1
         elif vendor == "NVIDIA" and shutil.which("nvidia-smi"):
             if nv is None:
                 nv = nvidia_stats()
@@ -341,10 +372,16 @@ def scan():
                 g["short"] = short_name(st["name"])
 
         conns = []
+        monitor_names = {}
         for c in sorted(glob.glob(f"{DRM}/{card}-*")):
             if read(f"{c}/status") == "connected":
-                conns.append((os.path.basename(c)[len(card) + 1:], read(f"{c}/enabled") == "enabled"))
+                connector = os.path.basename(c)[len(card) + 1:]
+                conns.append((connector, read(f"{c}/enabled") == "enabled"))
+                monitor_name = edid_monitor_name(c)
+                if monitor_name:
+                    monitor_names[connector] = monitor_name
         g["conns"] = conns
+        g["monitor_names"] = monitor_names
         g["modes"] = modes
         gpus.append(g)
     return gpus
@@ -403,7 +440,8 @@ def vram_processes(with_engine_times=False):
     for pci, apps in nvidia_apps().items():
         d = per_pci.setdefault(pci, {})
         for pid, (name, mb) in apps.items():
-            d[pid] = d.get(pid, 0) + mb
+            pid = int(pid)
+            d[pid] = max(d.get(pid, 0), mb)
 
     out = {}
     for pci, d in per_pci.items():
@@ -510,15 +548,22 @@ def kwin_draw_pci():
 
 
 def configured_ai_pci():
-    m = re.search(r"^# ai-gpu=(\S+)", read(ENV_FILE), re.M)
+    content = read(ENV_FILE)
+    if not content.startswith(ENV_MARKER + "\n"):
+        return None
+    m = re.search(r"^# ai-gpu=(\S+)$", content, re.M)
     return m.group(1) if m else None
+
+
+def has_managed_env():
+    return read(ENV_FILE).startswith(ENV_MARKER + "\n")
 
 
 def write_env(ai_pci, order):
     os.makedirs(os.path.dirname(ENV_FILE), exist_ok=True)
     with open(ENV_FILE, "w") as f:
         f.write(
-            "# Створено gpu_tinker.py. Видаліть цей файл, щоб повернути стандартну поведінку.\n"
+            f"{ENV_MARKER}\n"
             f"# ai-gpu={ai_pci}\n"
             f"for p in {' '.join(order)}; do\n"
             '  d=$(readlink -f "/dev/dri/by-path/pci-$p-card")\n'
@@ -815,7 +860,7 @@ class App(QWidget):
 
     def apply(self, data):
         self.data = data
-        sig = tuple((g["card"], tuple(c[0] for c in g["conns"])) for g in data)
+        sig = tuple((g["card"], g["pci"], tuple(c[0] for c in g["conns"])) for g in data)
         if sig != self.sig:
             self.rebuild()
             self.sig = sig
@@ -851,7 +896,11 @@ class App(QWidget):
                 int(max(0.0, min(100.0, util))) if util is not None else 0)
             if w.get("fan_lbl") is not None and g.get("fan") is not None:
                 tgt = g.get("fan_target")
-                extra = f" (ціль {tgt:.0f} об/хв)" if tgt else " (авто)"
+                if g.get("fan_pwm_control"):
+                    extra = (f" (ручний режим, ціль {tgt:.0f} об/хв)"
+                             if g.get("fan_manual") and tgt is not None else " (авто)")
+                else:
+                    extra = f" (ціль {tgt:.0f} об/хв)" if tgt else " (авто)"
                 w["fan_lbl"].setText(f"Вентилятор: {g['fan']:.0f} об/хв{extra}")
             if w.get("pwr_slider") is not None and g.get("pwr_limit") is not None:
                 w["pwr_lbl"].setText(
@@ -860,7 +909,9 @@ class App(QWidget):
             for cname, enabled in g["conns"]:
                 cw = w["conns"][cname]
                 mode = (g.get("modes") or {}).get(cname)
-                cw["lbl"].setText(f"{cname} · {mode}" if mode else cname)
+                monitor = (g.get("monitor_names") or {}).get(cname)
+                label = " · ".join(part for part in (cname, monitor, mode) if part)
+                cw["lbl"].setText(label)
                 cw["state"].setText("увімкнено" if enabled else "вимкнено")
                 cw["state"].setStyleSheet(
                     f"color: {'#2e7d32' if enabled else '#b71c1c'};")
@@ -897,18 +948,29 @@ class App(QWidget):
                 fr = QHBoxLayout()
                 w["fan_lbl"] = QLabel()
                 fr.addWidget(w["fan_lbl"])
-                fr.addStretch(1)
-                sld = QSlider(Qt.Orientation.Horizontal)
-                sld.setRange(0, int(g["fan_max"]))
-                sld.setValue(int(g.get("fan_target") or g["fan"]))
-                sld.setFixedWidth(130)
-                fr.addWidget(sld)
-                fb = QPushButton("Застосувати (root — діалог KDE)")
-                fb.clicked.connect(lambda _=False, c=card: self.apply_fan(c))
-                fr.addWidget(fb)
+                if g.get("fan_pwm_control"):
+                    fr.addWidget(QLabel("PWM, % (20–100):"))
+                    fr.addStretch(1)
+                    sld = QSlider(Qt.Orientation.Horizontal)
+                    sld.setRange(20, 100)
+                    pwm_pct = (100 * g["fan_pwm"] / g["fan_pwm_max"]
+                               if g.get("fan_pwm") is not None and g.get("fan_pwm_max") else 20)
+                    sld.setValue(round(max(20, min(100, pwm_pct))))
+                    sld.setFixedWidth(130)
+                    fr.addWidget(sld)
+                    fb = QPushButton("Застосувати (root — діалог KDE)")
+                    fb.clicked.connect(lambda _=False, c=card: self.apply_fan(c))
+                    fr.addWidget(fb)
+                    auto = QPushButton("Авто")
+                    auto.clicked.connect(lambda _=False, c=card: self.apply_fan_auto(c))
+                    fr.addWidget(auto)
+                    w["fan_auto_btn"] = auto
+                    w["fan_slider"] = sld
+                else:
+                    fr.addWidget(QLabel("Керування недоступне"))
                 v.addLayout(fr)
-                w["fan_slider"] = sld
-            if g.get("pwr_limit") is not None and g.get("pwr_max"):
+            if (g.get("pwr_limit") is not None and g.get("pwr_min") is not None
+                    and g.get("pwr_max") is not None):
                 pr = QHBoxLayout()
                 w["pwr_lbl"] = QLabel()
                 pr.addWidget(w["pwr_lbl"])
@@ -985,6 +1047,9 @@ class App(QWidget):
     def on_combo(self, idx):
         if 0 <= idx < len(getattr(self, "combo_map", [])):
             self.ai_pci = self.combo_map[idx][0]
+            ai = next((g for g in self.data if g["pci"] == self.ai_pci), None)
+            self.sync_checks(ai)
+            self.update_mode_label()
 
     def sync_checks(self, ai):
         """Синхронізує чекбокси з фактичним станом (на старті та після дій)."""
@@ -992,23 +1057,36 @@ class App(QWidget):
             self.chk_monitors.setChecked(not any(e for _, e in ai["conns"]))
         else:
             self.chk_monitors.setChecked(False)
-        self.chk_desktop.setChecked(
-            os.path.exists(ENV_FILE) and configured_ai_pci() == (ai["pci"] if ai else None))
+        self.chk_desktop.setChecked(has_managed_env())
 
     def update_mode_label(self):
         ai = next((g for g in self.data if g["pci"] == self.ai_pci), None)
         ai_name = ai["short"] if ai else "обрана карта"
         draw = kwin_draw_pci()
-        cfg = os.path.exists(ENV_FILE) and configured_ai_pci() == (ai["pci"] if ai else None)
+        configured = configured_ai_pci()
+        cfg = configured == (ai["pci"] if ai else None)
         if ai and draw and draw != ai["pci"]:
             other = next((g for g in self.data if g["pci"] == draw), None)
             txt = f"Робочий стіл малює на {other['short'] if other else draw}. " \
                   f"{ai_name} вільна для обчислень."
-            if not cfg:
-                txt += " Файл налаштувань видалено — після наступного входу режим буде стандартним."
+            if configured and not cfg:
+                configured_gpu = next((g for g in self.data if g["pci"] == configured), None)
+                txt += (f" Наступний вхід налаштовано для "
+                        f"{configured_gpu['short'] if configured_gpu else configured}.")
+            elif not has_managed_env() and os.path.exists(ENV_FILE):
+                txt += " Файл налаштувань не належить GPU Tinker і не буде змінений."
+            elif not cfg:
+                txt += " Після наступного входу режим буде стандартним."
         elif cfg and ai:
             txt = (f"Після перелогіну робочий стіл малюватиме на іншій карті; у цій сесії "
                    f"він досі на {ai_name}. Потрібен вихід і повторний вхід.")
+        elif configured:
+            configured_gpu = next((g for g in self.data if g["pci"] == configured), None)
+            txt = (f"Налаштування наступного входу активне для "
+                   f"{configured_gpu['short'] if configured_gpu else configured}; "
+                   "у цій сесії KWin ще не перезапущено.")
+        elif os.path.exists(ENV_FILE):
+            txt = "Файл налаштувань не належить GPU Tinker і не буде змінений."
         else:
             txt = "Стандартний режим: робочий стіл малює на головній карті, яку обрала система."
         self.mode_label.setText(txt)
@@ -1165,20 +1243,72 @@ class App(QWidget):
         w = self.widgets.get(card, {})
         if not g or "fan_slider" not in w:
             return
-        path = next(iter(glob.glob(f"{DRM}/{card}/device/hwmon/hwmon*/fan1_target")), None)
-        if not path:
-            self.set_status("Не знайдено fan1_target", "warn")
+        pwm_path = next(iter(glob.glob(f"{DRM}/{card}/device/hwmon/hwmon*/pwm1")), None)
+        if not pwm_path:
+            self.set_status("Не знайдено pwm1 для ручного керування вентилятором.", "warn")
             return
-        val = w["fan_slider"].value()
+        pwm_max = to_int(read(os.path.join(os.path.dirname(pwm_path), "pwm1_max")))
+        if not pwm_max or pwm_max < 1:
+            self.set_status("Не вдалося визначити максимальне значення PWM вентилятора.", "warn")
+            return
+        percent = w["fan_slider"].value()
+        pwm_value = max(1, round(pwm_max * percent / 100))
         sh = shutil.which("sh") or "/bin/sh"
-        r = self._pkexec(["pkexec", sh, "-c", f"echo {val} > {path}"])
+        mode_path = os.path.join(os.path.dirname(pwm_path), "pwm1_enable")
+        if not os.path.exists(mode_path):
+            self.set_status("Не знайдено pwm1_enable для перемикання режиму вентилятора.", "warn")
+            return
+        script = (
+            'old=$(cat "$1") || exit 1; '
+            'printf "1\\n" > "$1" || exit 1; '
+            'mode=$(cat "$1") || { printf "Не вдалося перевірити режим вентилятора\\n" >&2; '
+            'printf "%s\\n" "$old" > "$1"; exit 1; }; '
+            '[ "$mode" = 1 ] || { printf "Драйвер не ввімкнув ручний режим вентилятора\\n" >&2; '
+            'printf "%s\\n" "$old" > "$1"; exit 1; }; '
+            'if ! printf "%s\\n" "$3" > "$2"; then '
+            'printf "%s\\n" "$old" > "$1" || '
+            'printf "Не вдалося відновити попередній режим вентилятора\\n" >&2; '
+            'exit 1; fi'
+        )
+        cmd = ["pkexec", sh, "-c", script, "gpu-tinker", mode_path, pwm_path, str(pwm_value)]
+        r = self._pkexec(cmd)
         if r is None:
             return
         if r.returncode == 0:
-            self.set_status(f"Ціль вентилятора: {val} об/хв", "ok")
+            self.set_status(f"Швидкість вентилятора: PWM {percent}% ({pwm_value}/{pwm_max})", "ok")
             QTimer.singleShot(1200, self.tick)
         else:
-            self.set_status("Не вдалося встановити швидкість вентилятора", "warn")
+            err = (r.stderr or r.stdout).strip().splitlines()
+            detail = err[-1][:120] if err else f"код завершення {r.returncode}"
+            self.set_status(f"Не вдалося встановити швидкість вентилятора: {detail}", "warn")
+
+    def apply_fan_auto(self, card):
+        g = next((x for x in self.data if x["card"] == card), None)
+        w = self.widgets.get(card, {})
+        if not g or "fan_auto_btn" not in w:
+            return
+        path = next(iter(glob.glob(f"{DRM}/{card}/device/hwmon/hwmon*/pwm1_enable")), None)
+        if not path:
+            self.set_status("Не знайдено pwm1_enable для повернення до авторежиму.", "warn")
+            return
+        sh = shutil.which("sh") or "/bin/sh"
+        script = (
+            'printf "2\\n" > "$1" || exit 1; '
+            'mode=$(cat "$1") || exit 1; '
+            '[ "$mode" = 2 ] || { printf "Драйвер не повернув автоматичний режим вентилятора\\n" >&2; '
+            'exit 1; }'
+        )
+        r = self._pkexec(["pkexec", sh, "-c", script,
+                          "gpu-tinker", path])
+        if r is None:
+            return
+        if r.returncode == 0:
+            self.set_status("Автоматичне керування вентилятором увімкнено.", "ok")
+            QTimer.singleShot(1200, self.tick)
+        else:
+            err = (r.stderr or r.stdout).strip().splitlines()
+            detail = err[-1][:120] if err else f"код завершення {r.returncode}"
+            self.set_status(f"Не вдалося повернути авторежим вентилятора: {detail}", "warn")
 
     def apply_power(self, card):
         g = next((x for x in self.data if x["card"] == card), None)
@@ -1315,6 +1445,7 @@ class App(QWidget):
         if not enable and not [n for n in self.enabled_outputs() if n not in names]:
             QMessageBox.critical(self, "Не можна",
                                  "Це вимкнуло б усі монітори. Залиште хоча б один увімкненим.")
+            self.set_status("Не можна вимкнути останній активний монітор.", "warn")
             return False
         errors = []
         for n in names:
@@ -1336,27 +1467,44 @@ class App(QWidget):
         env_changed = False
 
         cur_all_off = not any(e for _, e in ai["conns"])
+        monitor_error = None
         if ai["conns"] and want_mon_off != cur_all_off:
             names = [n for n, e in ai["conns"] if e == want_mon_off]
-            self.change(names, not want_mon_off)
+            if not self.change(names, not want_mon_off):
+                monitor_error = self.status.text() or "Не вдалося змінити стан моніторів."
 
-        cfg = os.path.exists(ENV_FILE) and configured_ai_pci() == ai["pci"]
+        cfg = configured_ai_pci() == ai["pci"]
         if want_desktop and not cfg:
+            if os.path.exists(ENV_FILE) and not has_managed_env():
+                QMessageBox.critical(
+                    self, "Не можна",
+                    f"Файл {ENV_FILE} уже існує і не створений GPU Tinker. "
+                    "Він залишився без змін; перейменуйте його, якщо хочете створити "
+                    "налаштування GPU Tinker.")
+                return
             others = [g for g in self.data if g is not ai]
-            if not any(g["conns"] for g in others):
+            if not any(e for g in others for _, e in g["conns"]):
                 QMessageBox.critical(self, "Не можна",
-                                     "До інших карт не підключено жодного монітора, "
+                                     "До інших карт не підключено жодного увімкненого монітора, "
                                      "тож робочому столу нема де малювати.")
                 return
             order = [g["pci"] for g in sorted(others, key=lambda g: g["total"] or 0)] + [ai["pci"]]
-            write_env(ai["pci"], order)
+            try:
+                write_env(ai["pci"], order)
+            except OSError as e:
+                QMessageBox.critical(self, "Не вдалося зберегти налаштування", str(e))
+                return
             env_changed = True
-        elif not want_desktop and os.path.exists(ENV_FILE):
+        elif not want_desktop and has_managed_env():
             try:
                 os.remove(ENV_FILE)
             except FileNotFoundError:
-                pass
-            env_changed = True
+                env_changed = False
+            except OSError as e:
+                QMessageBox.critical(self, "Не вдалося видалити налаштування", str(e))
+                return
+            else:
+                env_changed = True
 
         self.data = scan()
         self.apply(self.data)
@@ -1370,39 +1518,59 @@ class App(QWidget):
                     "Спершу збережіть роботу у відкритих програмах. Вийти зараз?") \
                     == QMessageBox.StandardButton.Yes:
                 logout()
+        if monitor_error:
+            self.set_status(f"Налаштування моніторів не застосовано: {monitor_error}", "warn")
+        elif not env_changed and os.path.exists(ENV_FILE) and not has_managed_env():
+            self.set_status("Сторонній файл налаштувань залишено без змін.", "warn")
 
     def reset_all(self):
         if QMessageBox.question(
                 self, "Скасувати",
-                "Увімкнути всі монітори і видалити файл налаштувань?") != QMessageBox.StandardButton.Yes:
+                "Увімкнути всі монітори і видалити налаштування GPU Tinker?") \
+                != QMessageBox.StandardButton.Yes:
             return
-        try:
-            os.remove(ENV_FILE)
-        except FileNotFoundError:
-            pass
+        env_changed = False
+        env_error = None
+        if has_managed_env():
+            try:
+                os.remove(ENV_FILE)
+                env_changed = True
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                env_error = str(e)
         for g in self.data:
             self.change([n for n, e in g["conns"] if not e], True)
         self.data = scan()
         self.apply(self.data)
         ai = next((g for g in self.data if g["pci"] == self.ai_pci), None)
         self.sync_checks(ai)
-        if QMessageBox.question(
-                self, "Перелогін",
-                "Щоб робочий стіл повернувся на головну карту, потрібен вихід з сесії. Вийти зараз?") \
-                == QMessageBox.StandardButton.Yes:
-            logout()
+        if env_changed:
+            if QMessageBox.question(
+                    self, "Перелогін",
+                    "Щоб робочий стіл повернувся на головну карту, потрібен вихід з сесії. "
+                    "Вийти зараз?") == QMessageBox.StandardButton.Yes:
+                logout()
+        elif env_error:
+            self.set_status(f"Не вдалося видалити налаштування: {env_error}", "warn")
+        elif os.path.exists(ENV_FILE):
+            self.set_status("Сторонній файл налаштувань залишено без змін.", "warn")
 
     def kill_selected(self):
         item = self.tree.currentItem()
         if not item:
             return
         pid, name = item.text(2), item.text(1)
+        pid = to_int(pid)
+        if pid is None or pid <= 0:
+            self.set_status("Вибраний рядок не відповідає процесу, який можна завершити.", "warn")
+            return
         if QMessageBox.question(self, "Завершити процес",
                                 f"Завершити {name} (PID {pid})?\nНезбережені дані буде втрачено.") \
                 != QMessageBox.StandardButton.Yes:
             return
         try:
-            os.kill(int(pid), signal.SIGTERM)
+            os.kill(pid, signal.SIGTERM)
             self.status.setText(f"Надіслано SIGTERM процесу {name} ({pid})")
         except OSError as e:
             self.status.setText(f"Не вдалося завершити {name}: {e}")
